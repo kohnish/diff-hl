@@ -6,6 +6,7 @@
 ;; URL:      https://github.com/dgutov/diff-hl
 ;; Keywords: vc, diff
 ;; Version:  1.10.0
+;; Package-Requires: ((cl-lib "0.2") (emacs "26.1"))
 
 ;; This file is part of GNU Emacs.
 
@@ -146,6 +147,12 @@
            (set-default var value)
            (when on (global-diff-hl-mode 1)))))
 
+(defcustom diff-hl-bmp-max-width 16
+  "Maximum width of the fringe indicator bitmaps, in pixels.
+The bitmap width is decided by comparing this value with the current width
+of the fringe.  When the fringe is hidden, this value is also used."
+  :type 'integer)
+
 (defcustom diff-hl-highlight-revert-hunk-function
   #'diff-hl-revert-narrow-to-hunk
   "Function to emphasize the current hunk in `diff-hl-revert-hunk'.
@@ -213,7 +220,10 @@ If any returns non-nil, `diff-hl-update' will run synchronously anyway."
   :type '(repeat :tag "Predicate" function))
 
 (defvar diff-hl-reference-revision nil
-  "Revision to diff against.  nil means the most recent one.")
+  "Revision to diff against.  nil means the most recent one.
+
+It can be a relative expression as well, such as \"HEAD^\" with Git, or
+\"-2\" with Mercurial.")
 
 (defun diff-hl-define-bitmaps ()
   (let* ((scale (if (and (boundp 'text-scale-mode-amount)
@@ -226,8 +236,8 @@ If any returns non-nil, `diff-hl-update' will run synchronously anyway."
                    (truncate (* (frame-char-height) spacing))
                  spacing)))
          (w (min (frame-parameter nil (intern (format "%s-fringe" diff-hl-side)))
-                 16))
-         (_ (when (zerop w) (setq w 16)))
+                 diff-hl-bmp-max-width))
+         (_ (when (zerop w) (setq w diff-hl-bmp-max-width)))
          (middle (make-vector h (expt 2 (1- w))))
          (ones (1- (expt 2 w)))
          (top (copy-sequence middle))
@@ -327,6 +337,8 @@ If any returns non-nil, `diff-hl-update' will run synchronously anyway."
                diff-hl-reference-revision))))
 
 (declare-function vc-git-command "vc-git")
+(declare-function vc-git--rev-parse "vc-git")
+(declare-function vc-hg-command "vc-hg")
 
 (defun diff-hl-changes-buffer (file backend)
   (diff-hl-with-diff-switches
@@ -408,7 +420,17 @@ If any returns non-nil, `diff-hl-update' will run synchronously anyway."
             (run-hook-with-args-until-success 'diff-hl-async-inhibit-functions
                                               default-directory)))
       ;; TODO: debounce if a thread is already running.
-      (make-thread 'diff-hl--update-safe "diff-hl--update-safe")
+      (let ((buf (current-buffer))
+            (temp-buffer (generate-new-buffer " *temp*" t)))
+        ;; Switch buffer temporarily, to "unlock" it for other threads.
+        (with-current-buffer temp-buffer
+          (make-thread
+           (lambda ()
+             (kill-buffer temp-buffer)
+             (when (buffer-live-p buf)
+               (set-buffer buf)
+               (diff-hl--update-safe)))
+           "diff-hl--update-safe")))
     (diff-hl--update)))
 
 (defun diff-hl-with-editor-p (_dir)
@@ -500,9 +522,10 @@ If any returns non-nil, `diff-hl-update' will run synchronously anyway."
           (run-with-idle-timer 0.01 nil #'diff-hl-after-undo (current-buffer)))))
 
 (defun diff-hl-after-undo (buffer)
-  (with-current-buffer buffer
-    (unless (buffer-modified-p)
-      (diff-hl-update))))
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (unless (buffer-modified-p)
+        (diff-hl-update)))))
 
 (defun diff-hl-after-revert ()
   (when (bound-and-true-p revert-buffer-preserve-modes)
@@ -748,7 +771,7 @@ its end position."
       (user-error "Only Git supports staging; this file is controlled by %s" backend))))
 
 (defun diff-hl-stage-diff (orig-buffer)
-  (let ((patchfile (make-temp-file "diff-hl-stage-patch"))
+  (let ((patchfile (make-nearby-temp-file "diff-hl-stage-patch"))
         success)
     (write-region (point-min) (point-max) patchfile
                   nil 'silent)
@@ -756,7 +779,7 @@ its end position."
         (with-current-buffer orig-buffer
           (with-output-to-string
             (vc-git-command standard-output 0
-                            patchfile
+                            (file-local-name patchfile)
                             "apply" "--cached" )
             (setq success t)))
       (delete-file patchfile))
@@ -994,49 +1017,38 @@ The value of this variable is a mode line template as in
  diff-hl-command-map)
 
 (declare-function magit-toplevel "magit-git")
-(declare-function magit-unstaged-files "magit-git")
+(declare-function magit-git-items "magit-git")
 
-(defvar diff-hl--magit-unstaged-files nil)
-
-(defun diff-hl-magit-pre-refresh ()
-  (unless (and diff-hl-disable-on-remote
-               (file-remote-p default-directory))
-   (setq diff-hl--magit-unstaged-files (magit-unstaged-files t))))
+(define-obsolete-function-alias 'diff-hl-magit-pre-refresh 'ignore "1.11.0")
 
 (defun diff-hl-magit-post-refresh ()
   (unless (and diff-hl-disable-on-remote
                (file-remote-p default-directory))
-   (let* ((topdir (magit-toplevel))
-         (modified-files
-          (mapcar (lambda (file) (expand-file-name file topdir))
-                  (delete-consecutive-dups
-                   (sort
-                    (nconc (magit-unstaged-files t)
-                           diff-hl--magit-unstaged-files)
-                    #'string<))))
-         (unmodified-states '(up-to-date ignored unregistered)))
-    (setq diff-hl--magit-unstaged-files nil)
-    (dolist (buf (buffer-list))
-      (when (and (buffer-local-value 'diff-hl-mode buf)
-                 (not (buffer-modified-p buf))
-                 ;; Solve the "cloned indirect buffer" problem
-                 ;; (diff-hl-mode could be non-nil there, even if
-                 ;; buffer-file-name is nil):
-                 (buffer-file-name buf)
-                 (file-in-directory-p (buffer-file-name buf) topdir)
-                 (file-exists-p (buffer-file-name buf)))
-        (with-current-buffer buf
-          (let* ((file buffer-file-name)
-                 (backend (vc-backend file)))
-            (when backend
-              (cond
-               ((member file modified-files)
-                (when (memq (vc-state file) unmodified-states)
-                  (vc-state-refresh file backend))
-                (diff-hl-update))
-               ((not (memq (vc-state file backend) unmodified-states))
-                (vc-state-refresh file backend)
-                (diff-hl-update)))))))))))
+    (let* ((topdir (magit-toplevel))
+           (modified-files
+            (magit-git-items "diff-tree" "-z" "--name-only" "-r" "HEAD~" "HEAD"))
+           (unmodified-states '(up-to-date ignored unregistered)))
+      (dolist (buf (buffer-list))
+        (when (and (buffer-local-value 'diff-hl-mode buf)
+                   (not (buffer-modified-p buf))
+                   ;; Solve the "cloned indirect buffer" problem
+                   ;; (diff-hl-mode could be non-nil there, even if
+                   ;; buffer-file-name is nil):
+                   (buffer-file-name buf)
+                   (file-in-directory-p (buffer-file-name buf) topdir)
+                   (file-exists-p (buffer-file-name buf)))
+          (with-current-buffer buf
+            (let* ((file buffer-file-name)
+                   (backend (vc-backend file)))
+              (when backend
+                (cond
+                 ((member file modified-files)
+                  (when (memq (vc-state file) unmodified-states)
+                    (vc-state-refresh file backend))
+                  (diff-hl-update))
+                 ((not (memq (vc-state file backend) unmodified-states))
+                  (vc-state-refresh file backend)
+                  (diff-hl-update)))))))))))
 
 (defun diff-hl-dir-update ()
   (dolist (pair (if (vc-dir-marked-files)
@@ -1123,7 +1135,7 @@ CONTEXT-LINES is the size of the unified diff context, defaults to 0."
                  (diff-hl-git-index-object-name file))
               (diff-hl-create-revision
                file
-               (or diff-hl-reference-revision
+               (or (diff-hl-resolved-reference-revision backend)
                    (diff-hl-working-revision file backend)))))
            (switches (format "-U %d --strip-trailing-cr" (or context-lines 0))))
       (diff-no-select rev (current-buffer) switches 'noasync
@@ -1134,13 +1146,29 @@ CONTEXT-LINES is the size of the unified diff context, defaults to 0."
           (delete-matching-lines "^Diff finished.*")))
       (get-buffer-create dest-buffer))))
 
+(defun diff-hl-resolved-reference-revision (backend)
+  (cond
+   ((null diff-hl-reference-revision)
+    nil)
+   ((eq backend 'Git)
+    (vc-git--rev-parse diff-hl-reference-revision))
+   ((eq backend 'Hg)
+    (with-temp-buffer
+      (vc-hg-command (current-buffer) 0 nil
+                     "identify" "-r" diff-hl-reference-revision
+                     "-i")
+      (goto-char (point-min))
+      (buffer-substring-no-properties (point) (line-end-position))))
+   (t
+    diff-hl-reference-revision)))
+
 ;; TODO: Cache based on .git/index's mtime, maybe.
 (defun diff-hl-git-index-object-name (file)
   (with-temp-buffer
     (vc-git-command (current-buffer) 0 file "ls-files" "-s")
     (and
      (goto-char (point-min))
-     (re-search-forward "^[0-9]+ \\([0-9a-f]+\\)")
+     (re-search-forward "^[0-9]+ \\([0-9a-f]+\\)" nil t)
      (match-string-no-properties 1))))
 
 (defun diff-hl-git-index-revision (file object-name)
